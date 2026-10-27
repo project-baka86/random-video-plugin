@@ -2,16 +2,17 @@ import plugin from '../../lib/plugins/plugin.js'
 import fs from 'node:fs'
 import path from 'node:path'
 import axios from 'axios'
+import { VideoStore, normalizeBvid } from './lib/store.js'
 
 /**
  * 抽象视频插件
  * 指令：#来个抽象视频, #添加抽象视频 [BV号]
- * 存储：videolist.json
+ * 存储：videolist.json（与 lib/api-server.js 分发 API 共用同一份数据）
  */
 
-const _path = process.cwd()
-const dirPath = path.join(_path, 'plugins', 'randomvideo')
-const filePath = path.join(dirPath, 'videolist.json')
+// 与 API 共用同一个列表文件，支持 VIDEO_DATA_FILE 环境变量覆盖
+const store = new VideoStore()
+const dirPath = store.dir
 
 // 哔哩哔哩请求头
 const BILI_HEADER = {
@@ -38,12 +39,9 @@ class RandomVideo extends plugin {
       ]
     })
 
-    // 初始化目录和文件
+    // 初始化目录和文件（VideoStore 构造函数已完成，此处兜底）
     if (!fs.existsSync(dirPath)) {
       fs.mkdirSync(dirPath, { recursive: true })
-    }
-    if (!fs.existsSync(filePath)) {
-      fs.writeFileSync(filePath, '[]', 'utf-8')
     }
   }
 
@@ -51,14 +49,7 @@ class RandomVideo extends plugin {
    * 获取视频列表
    */
   getList() {
-    try {
-      if (!fs.existsSync(filePath)) return []
-      const content = fs.readFileSync(filePath, 'utf-8')
-      return JSON.parse(content || '[]')
-    } catch (e) {
-      logger.error('[抽象视频] 读取列表失败', e)
-      return []
-    }
+    return store.list()
   }
 
   /**
@@ -66,7 +57,7 @@ class RandomVideo extends plugin {
    */
   saveList(list) {
     try {
-      fs.writeFileSync(filePath, JSON.stringify(list, null, 2), 'utf-8')
+      store.save(list)
     } catch (e) {
       logger.error('[抽象视频] 保存列表失败', e)
     }
@@ -76,30 +67,13 @@ class RandomVideo extends plugin {
    * 添加视频
    */
   async addVideo(e) {
-    let bvid = e.msg.replace('#添加抽象视频', '').trim()
-    
-    if (!bvid) {
-      const reg = /BV[a-zA-Z0-9]{10}/i
-      const match = reg.exec(e.msg)
-      if (match) {
-        bvid = match[0]
-      }
-    }
+    const bvid = normalizeBvid(e.msg)
 
     if (!bvid) {
       return e.reply('请提供正确的BV号，例如：#添加抽象视频BV1xxxx')
     }
 
-    // 格式化BV号
-    if (!bvid.startsWith('BV')) {
-       const reg = /BV[a-zA-Z0-9]{10}/i
-       const match = reg.exec(bvid)
-       if (match) bvid = match[0]
-       else return e.reply('BV号格式不正确')
-    }
-
-    let list = this.getList()
-    if (list.find(item => item.bvid === bvid)) {
+    if (store.has(bvid)) {
       return e.reply('该视频已在列表中')
     }
 
@@ -124,8 +98,7 @@ class RandomVideo extends plugin {
         title: data.title
       }
 
-      list.push(newItem)
-      this.saveList(list)
+      store.add(newItem)
       return e.reply(`[抽象视频] 添加成功！\n标题：${data.title}\nBV号：${bvid}`)
     } catch (err) {
       logger.error('[抽象视频] 验证视频出错', err)
