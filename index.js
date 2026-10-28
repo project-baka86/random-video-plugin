@@ -1,24 +1,25 @@
 import plugin from '../../lib/plugins/plugin.js'
 import fs from 'node:fs'
 import path from 'node:path'
-import axios from 'axios'
+import { Readable } from 'node:stream'
+import { pipeline } from 'node:stream/promises'
 import { VideoStore, normalizeBvid } from './lib/store.js'
+import { getVideoInfo, getPlayUrl, openVideoStream } from './lib/bilibili.js'
 
 /**
  * 抽象视频插件
  * 指令：#来个抽象视频, #添加抽象视频 [BV号]
- * 存储：videolist.json（与 lib/api-server.js 分发 API 共用同一份数据）
+ * 存储：videolist.json（与随机视频分发 API 共用同一份数据）
+ *
+ * 零第三方依赖：B 站解析复用 lib/bilibili.js（Node 18+ 全局 fetch，含 412 风控降级）。
  */
 
 // 与 API 共用同一个列表文件，支持 VIDEO_DATA_FILE 环境变量覆盖
 const store = new VideoStore()
 const dirPath = store.dir
 
-// 哔哩哔哩请求头
-const BILI_HEADER = {
-  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36',
-  'Referer': 'https://www.bilibili.com'
-}
+// 单个视频大小上限，与 API 的 MAX_VIDEO_MB 默认值保持一致
+const MAX_VIDEO_MB = Number(process.env.MAX_VIDEO_MB) || 50
 
 class RandomVideo extends plugin {
   constructor() {
@@ -77,18 +78,8 @@ class RandomVideo extends plugin {
       return e.reply('该视频已在列表中')
     }
 
-    // 验证视频是否存在 (参考 tools.js 逻辑)
     try {
-      const res = await axios.get(`https://api.bilibili.com/x/web-interface/view?bvid=${bvid}`, { 
-        headers: BILI_HEADER,
-        timeout: 10000 
-      })
-
-      if (res.data.code !== 0) {
-        return e.reply(`视频验证失败：${res.data.message}`)
-      }
-
-      const data = res.data.data
+      const data = await getVideoInfo(bvid)
       const newItem = {
         added_by: e.sender.nickname || e.user_id,
         qq: e.user_id,
@@ -102,6 +93,9 @@ class RandomVideo extends plugin {
       return e.reply(`[抽象视频] 添加成功！\n标题：${data.title}\nBV号：${bvid}`)
     } catch (err) {
       logger.error('[抽象视频] 验证视频出错', err)
+      if (err?.status === 404) {
+        return e.reply(`视频验证失败：${err.message}`)
+      }
       return e.reply('验证视频时发生错误')
     }
   }
@@ -110,7 +104,7 @@ class RandomVideo extends plugin {
    * 随机播放视频
    */
   async randomVideo(e) {
-    e.reply("稍等哦，我正在给你找个抽象小视频",false,{ recallMsg: 5})
+    e.reply('稍等哦，我正在给你找个抽象小视频', false, { recallMsg: 5 })
     let list = this.getList()
     if (list.length === 0) {
       return e.reply('当前列表为空，请先使用 #添加抽象视频 [BV号] 添加视频')
@@ -126,61 +120,48 @@ class RandomVideo extends plugin {
       const { bvid } = item
 
       try {
-        // 1. 获取 CID
-        const viewRes = await axios.get(`https://api.bilibili.com/x/web-interface/view?bvid=${bvid}`, { 
-          headers: BILI_HEADER,
-          timeout: 10000 
-        })
-
-        if (viewRes.data.code !== 0) {
-          logger.info(`[抽象视频] 视频 ${bvid} 已失效，自动移除`)
-          list.splice(index, 1)
-          this.saveList(list)
+        // 1. 解析视频信息（失效视频自动移除）
+        let info
+        try {
+          info = await getVideoInfo(bvid)
+        } catch (err) {
+          if (err?.status === 404) {
+            logger.info(`[抽象视频] 视频 ${bvid} 已失效，自动移除`)
+            list.splice(index, 1)
+            this.saveList(list)
+          } else {
+            logger.info(`[抽象视频] 视频 ${bvid} 解析失败：${err?.message ?? err}`)
+          }
           return pickAndSend(retryCount + 1)
         }
 
-        const cid = viewRes.data.data.cid
-        
         // 2. 获取播放地址 (qn=32 为 480P)
-        const playRes = await axios.get(`https://api.bilibili.com/x/player/playurl?bvid=${bvid}&cid=${cid}&qn=32&type=mp4&platform=html5&high_quality=1`, { 
-          headers: BILI_HEADER,
-          timeout: 10000 
-        })
+        const play = await getPlayUrl(bvid, info.cid)
 
-        if (playRes.data.code !== 0 || !playRes.data.data?.durl?.[0]?.url) {
-          logger.info(`[抽象视频] 视频 ${bvid} 无法解析播放地址`)
-          return pickAndSend(retryCount + 1)
-        }
-
-        const durl = playRes.data.data.durl[0]
-        const videoUrl = durl.url
-        const fileSize = durl.size
-
-        // 3. 检查 50MB 限制 (50MB = 52428800 Bytes)
-        if (fileSize > 50 * 1024 * 1024) {
-          logger.info(`[抽象视频] 视频 ${bvid} 过大 (${(fileSize / 1024 / 1024).toFixed(2)}MB)，自动拦截并删除`)
+        // 3. 检查大小限制
+        if (play.size > MAX_VIDEO_MB * 1024 * 1024) {
+          logger.info(
+            `[抽象视频] 视频 ${bvid} 过大 (${(play.size / 1024 / 1024).toFixed(2)}MB)，自动拦截并删除`
+          )
           list.splice(index, 1)
           this.saveList(list)
           return pickAndSend(retryCount + 1)
         }
 
-        // 4. 下载并发送
+        // 4. 下载到临时文件
         const tempFile = path.join(dirPath, `${bvid}_${Date.now()}.mp4`)
-        const response = await axios({
-          url: videoUrl,
-          method: 'GET',
-          responseType: 'stream',
-          headers: BILI_HEADER,
-          timeout: 60000
-        })
+        const upstream = await openVideoStream(play.url, { timeout: 60000 })
+        if (!upstream.ok || !upstream.body) {
+          upstream.abort?.()
+          logger.info(`[抽象视频] 视频 ${bvid} 源站返回 HTTP ${upstream.status}`)
+          return pickAndSend(retryCount + 1)
+        }
 
-        const writer = fs.createWriteStream(tempFile)
-        response.data.pipe(writer)
-
-        await new Promise((resolve, reject) => {
-          writer.on('finish', resolve)
-          writer.on('error', reject)
-        })
+        try {
+          await pipeline(Readable.fromWeb(upstream.body), fs.createWriteStream(tempFile))
+        } finally {
+          upstream.abort?.()
+        }
 
         try {
           // 发送视频
@@ -194,7 +175,6 @@ class RandomVideo extends plugin {
         if (fs.existsSync(tempFile)) {
           fs.unlinkSync(tempFile)
         }
-
       } catch (err) {
         logger.error(`[抽象视频] 处理视频 ${bvid} 时出错`, err)
         return pickAndSend(retryCount + 1)

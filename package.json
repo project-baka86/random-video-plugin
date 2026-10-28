@@ -1,8 +1,8 @@
 {
   "name": "random-video-plugin",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "private": true,
-  "description": "Yunzai-Bot 随机抽象视频插件",
+  "description": "Yunzai-Bot 随机抽象视频插件（零依赖）",
   "type": "module",
   "main": "index.js",
   "engines": {
