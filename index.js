@@ -36,7 +36,12 @@ function uploadMeta(e) {
 
 /** 把上传者/群聊/时间格式化成回复里的三行。 */
 function formatSourceLines(meta) {
-  const group = meta.group_name ? `${meta.group_name}(${meta.group_id})` : meta.group_id
+  const group =
+    String(meta.group_id) === '私聊'
+      ? '私聊'
+      : meta.group_name
+        ? `${meta.group_name}(${meta.group_id})`
+        : meta.group_id
   const user = meta.added_by ? `${meta.added_by}${meta.qq ? `(${meta.qq})` : ''}` : String(meta.qq ?? '')
   return `时间：${meta.time}\n群聊：${group}\n上传者：${user}`
 }
@@ -96,7 +101,7 @@ class RandomVideo extends plugin {
 
     if (store.has(bvid)) {
       const existing = store.find(bvid)
-      const src = describeSource(existing, { prefix: '此前由' })
+      const src = describeSource(existing, { prefix: '此前来源' })
       return e.reply(`该视频已在列表中${src ? `\n${src}` : ''}`)
     }
 
