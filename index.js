@@ -3,7 +3,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
-import { VideoStore, normalizeBvid } from './lib/store.js'
+import { VideoStore, normalizeBvid, formatLocalTime, describeSource } from './lib/store.js'
 import { getVideoInfo, getPlayUrl, openVideoStream } from './lib/bilibili.js'
 
 /**
@@ -20,6 +20,26 @@ const dirPath = store.dir
 
 // 单个视频大小上限，与 API 的 MAX_VIDEO_MB 默认值保持一致
 const MAX_VIDEO_MB = Number(process.env.MAX_VIDEO_MB) || 50
+
+/** 从消息事件里提取「时间 / 群聊 / 上传者」，用于标注每条视频的来源。 */
+function uploadMeta(e) {
+  const now = new Date()
+  return {
+    added_by: e.sender?.card || e.sender?.nickname || String(e.user_id ?? ''),
+    qq: e.user_id ?? null,
+    group_id: e.group_id ?? '私聊',
+    group_name: e.group_name || (e.group_id ? '' : '私聊'),
+    time: formatLocalTime(now),
+    time_iso: now.toISOString()
+  }
+}
+
+/** 把上传者/群聊/时间格式化成回复里的三行。 */
+function formatSourceLines(meta) {
+  const group = meta.group_name ? `${meta.group_name}(${meta.group_id})` : meta.group_id
+  const user = meta.added_by ? `${meta.added_by}${meta.qq ? `(${meta.qq})` : ''}` : String(meta.qq ?? '')
+  return `时间：${meta.time}\n群聊：${group}\n上传者：${user}`
+}
 
 class RandomVideo extends plugin {
   constructor() {
@@ -75,22 +95,24 @@ class RandomVideo extends plugin {
     }
 
     if (store.has(bvid)) {
-      return e.reply('该视频已在列表中')
+      const existing = store.find(bvid)
+      const src = describeSource(existing, { prefix: '此前由' })
+      return e.reply(`该视频已在列表中${src ? `\n${src}` : ''}`)
     }
 
     try {
       const data = await getVideoInfo(bvid)
+      const meta = uploadMeta(e)
       const newItem = {
-        added_by: e.sender.nickname || e.user_id,
-        qq: e.user_id,
-        time: new Date().toLocaleString(),
         bvid: bvid,
-        group_id: e.group_id || '私聊',
-        title: data.title
+        title: data.title,
+        ...meta
       }
 
       store.add(newItem)
-      return e.reply(`[抽象视频] 添加成功！\n标题：${data.title}\nBV号：${bvid}`)
+      return e.reply(
+        `[抽象视频] 添加成功！\n标题：${data.title}\nBV号：${bvid}\n${formatSourceLines(meta)}`
+      )
     } catch (err) {
       logger.error('[抽象视频] 验证视频出错', err)
       if (err?.status === 404) {
@@ -164,8 +186,9 @@ class RandomVideo extends plugin {
         }
 
         try {
-          // 发送视频
-          await e.reply(segment.video(tempFile))
+          // 发送视频，并标注来源（时间 / 群聊 / 上传者）
+          const source = describeSource(item)
+          await e.reply(source ? [`${source}\n`, segment.video(tempFile)] : segment.video(tempFile))
         } catch (sendErr) {
           logger.error('[抽象视频] 发送视频失败', sendErr)
           await e.reply('视频发送失败')
