@@ -20,6 +20,9 @@ const dirPath = store.dir
 // 单个视频大小上限，与 API 的 MAX_VIDEO_MB 默认值保持一致
 const MAX_VIDEO_MB = Number(process.env.MAX_VIDEO_MB) || 50
 
+// 单个视频时长上限（分钟），与 API 的 MAX_VIDEO_MINUTES 默认值保持一致
+const MAX_VIDEO_MINUTES = Number(process.env.MAX_VIDEO_MINUTES) || 10
+
 /** 从消息事件里提取「时间 / 群聊 / 上传者」，用于标注每条视频的来源。 */
 function uploadMeta(e) {
   const now = new Date()
@@ -106,10 +109,20 @@ class RandomVideo extends plugin {
 
     try {
       const data = await getVideoInfo(bvid)
+
+      // 时长上限：超限直接拒绝，不入列表
+      const seconds = Number(data.duration) || 0
+      if (seconds > MAX_VIDEO_MINUTES * 60) {
+        return e.reply(
+          `该视频时长 ${(seconds / 60).toFixed(1)} 分钟，超过上限 ${MAX_VIDEO_MINUTES} 分钟，已拒绝添加`
+        )
+      }
+
       const meta = uploadMeta(e)
       const newItem = {
         bvid: bvid,
         title: data.title,
+        duration: data.duration,
         ...meta
       }
 
@@ -161,10 +174,20 @@ class RandomVideo extends plugin {
           return pickAndSend(retryCount + 1)
         }
 
-        // 2. 获取播放地址 (qn=32 为 480P)
+        // 2. 时长上限：过长直接拦截并移出列表（旧数据兜底）
+        if ((Number(info.duration) || 0) > MAX_VIDEO_MINUTES * 60) {
+          logger.info(
+            `[抽象视频] 视频 ${bvid} 时长过长 (${(info.duration / 60).toFixed(1)} 分钟)，自动拦截并删除`
+          )
+          list.splice(index, 1)
+          this.saveList(list)
+          return pickAndSend(retryCount + 1)
+        }
+
+        // 3. 获取播放地址 (qn=32 为 480P)
         const play = await getPlayUrl(bvid, info.cid)
 
-        // 3. 检查大小限制
+        // 4. 检查大小限制
         if (play.size > MAX_VIDEO_MB * 1024 * 1024) {
           logger.info(
             `[抽象视频] 视频 ${bvid} 过大 (${(play.size / 1024 / 1024).toFixed(2)}MB)，自动拦截并删除`
@@ -174,7 +197,7 @@ class RandomVideo extends plugin {
           return pickAndSend(retryCount + 1)
         }
 
-        // 4. 下载到临时文件（原生 fetch 的 web 流 / node-fetch 的 Node 流都兼容）
+        // 5. 下载到临时文件（原生 fetch 的 web 流 / node-fetch 的 Node 流都兼容）
         const tempFile = path.join(dirPath, `${bvid}_${Date.now()}.mp4`)
         const upstream = await openVideoStream(play.url, { timeout: 60000 })
         if (!upstream.ok || !upstream.body) {
