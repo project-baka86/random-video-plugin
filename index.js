@@ -1,10 +1,9 @@
 import plugin from '../../lib/plugins/plugin.js'
 import fs from 'node:fs'
 import path from 'node:path'
-import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import { VideoStore, normalizeBvid, formatLocalTime, describeSource } from './lib/store.js'
-import { getVideoInfo, getPlayUrl, openVideoStream } from './lib/bilibili.js'
+import { getVideoInfo, getPlayUrl, openVideoStream, toNodeStream, discardBody } from './lib/bilibili.js'
 
 /**
  * 抽象视频插件
@@ -175,17 +174,18 @@ class RandomVideo extends plugin {
           return pickAndSend(retryCount + 1)
         }
 
-        // 4. 下载到临时文件
+        // 4. 下载到临时文件（原生 fetch 的 web 流 / node-fetch 的 Node 流都兼容）
         const tempFile = path.join(dirPath, `${bvid}_${Date.now()}.mp4`)
         const upstream = await openVideoStream(play.url, { timeout: 60000 })
         if (!upstream.ok || !upstream.body) {
+          discardBody(upstream.body)
           upstream.abort?.()
           logger.info(`[抽象视频] 视频 ${bvid} 源站返回 HTTP ${upstream.status}`)
           return pickAndSend(retryCount + 1)
         }
 
         try {
-          await pipeline(Readable.fromWeb(upstream.body), fs.createWriteStream(tempFile))
+          await pipeline(toNodeStream(upstream.body), fs.createWriteStream(tempFile))
         } finally {
           upstream.abort?.()
         }
