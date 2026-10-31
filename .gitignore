@@ -4,3 +4,10 @@ instances.json
 cache/
 *.log
 *.part-*
+
+# API 专属文件（插件仓库不需要）
+lib/api-server.js
+lib/registry.js
+lib/reporter.js
+server.js
+test/
